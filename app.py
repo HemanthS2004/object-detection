@@ -1,12 +1,79 @@
-import gradio as gr
+import streamlit as st
 import cv2
 import tempfile
+import numpy as np
 from ultralytics import YOLO
 from collections import Counter
 import pandas as pd
+from PIL import Image
+import os
+
+# Page configuration
+st.set_page_config(
+    page_title="YOLOv8 Object Detector",
+    page_icon="🎯",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
+
+# Custom CSS for modern minimal design
+st.markdown("""
+<style>
+    * {
+        margin: 0;
+        padding: 0;
+    }
+    
+    body {
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    }
+    
+    .main {
+        background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+        min-height: 100vh;
+    }
+    
+    .stTabs [data-baseweb="tab-list"] button {
+        font-size: 16px;
+        font-weight: 600;
+        letter-spacing: 0.5px;
+    }
+    
+    .metric-box {
+        background: white;
+        padding: 20px;
+        border-radius: 12px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        border-left: 4px solid #3498db;
+    }
+    
+    .header-title {
+        font-size: 42px;
+        font-weight: 700;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        margin-bottom: 10px;
+    }
+    
+    .subheader-text {
+        color: #666;
+        font-size: 16px;
+        margin-bottom: 30px;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Initialize session state
+if 'processed_image' not in st.session_state:
+    st.session_state.processed_image = None
+if 'stats' not in st.session_state:
+    st.session_state.stats = None
+if 'confidence' not in st.session_state:
+    st.session_state.confidence = 0
 
 def get_detection_stats(results):
-    # Get detection statistics
+    """Extract detection statistics from YOLO results"""
     class_counts = Counter()
     confidences = []
     
@@ -21,171 +88,191 @@ def get_detection_stats(results):
     })
     
     avg_confidence = sum(confidences) / len(confidences) if confidences else 0
-    return stats_df, avg_confidence
+    return stats_df, avg_confidence, len(results[0].boxes)
 
-def run_yolo(image=None, video=None, model_name="yolov8n", image_size=640, conf_threshold=0.25):
-    # Load YOLO model
+def process_image(image, model_name, image_size, conf_threshold):
+    """Process image with YOLO"""
+    model = YOLO(model_name)
+    results = model.predict(source=image, imgsz=image_size, conf=conf_threshold, verbose=False)
+    annotated_image = results[0].plot()
+    stats_df, avg_confidence, detection_count = get_detection_stats(results)
+    return annotated_image[:, :, ::-1], stats_df, avg_confidence, detection_count
+
+def process_video(video_path, model_name, image_size, conf_threshold, progress_bar):
+    """Process video with YOLO"""
     model = YOLO(model_name)
     
-    if image is not None:
-        # Process image
-        results = model.predict(source=image, imgsz=image_size, conf=conf_threshold)
-        annotated_image = results[0].plot()
-        stats_df, avg_confidence = get_detection_stats(results)
-        return (
-            annotated_image[:, :, ::-1],  # Convert BGR to RGB for display
-            None,  # video output
-            stats_df,
-            f"{avg_confidence:.2%}"
-        )
-
-    elif video is not None:
-        # Process video
-        video_path = tempfile.mktemp(suffix=".mp4")
-        with open(video_path, "wb") as f:
-            f.write(video.read())
-
-        cap = cv2.VideoCapture(video_path)
-        fps = int(cap.get(cv2.CAP_PROP_FPS))
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-        output_path = tempfile.mktemp(suffix=".mp4")
-        out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
-
-        total_stats = Counter()
-        total_confidence = 0
-        frame_count = 0
-
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-            results = model.predict(source=frame, imgsz=image_size, conf=conf_threshold)
-            annotated_frame = results[0].plot()
-            out.write(annotated_frame)
-            
-            # Accumulate statistics
-            frame_stats, frame_conf = get_detection_stats(results)
-            for idx, row in frame_stats.iterrows():
-                total_stats[row['Class']] += row['Count']
-            total_confidence += frame_conf
-            frame_count += 1
-
-        cap.release()
-        out.release()
-
-        # Prepare final statistics
-        stats_df = pd.DataFrame({
-            'Class': list(total_stats.keys()),
-            'Count': list(total_stats.values())
-        })
-        avg_confidence = (total_confidence / frame_count) if frame_count > 0 else 0
-
-        return None, output_path, stats_df, f"{avg_confidence:.2%}"
-
-    return None, None, pd.DataFrame(), "0%"
-
-def run_realtime_yolo(model_name: str, image_size: int, conf_threshold: float):
-    model_rt = YOLO(model_name)
-    cap = cv2.VideoCapture(0)  # Open default webcam
-
-    while True:
+    cap = cv2.VideoCapture(video_path)
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    output_path = tempfile.mktemp(suffix=".mp4")
+    out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
+    
+    total_stats = Counter()
+    total_confidence = 0
+    frame_count = 0
+    total_detections = 0
+    
+    while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
-        results = model_rt.predict(source=frame, imgsz=image_size, conf=conf_threshold)
+        
+        results = model.predict(source=frame, imgsz=image_size, conf=conf_threshold, verbose=False)
         annotated_frame = results[0].plot()
-
-        # Get live stats for current frame
-        class_counts = Counter()
-        for detection in results[0].boxes:
-            class_name = results[0].names[int(detection.cls)]
-            class_counts[class_name] += 1
-        stats_df = pd.DataFrame({
-            'Class': list(class_counts.keys()),
-            'Count': list(class_counts.values())
-        })
-        avg_confidence = sum(float(detection.conf) for detection in results[0].boxes) / len(results[0].boxes) if results[0].boxes else 0
-
-        # Return annotated frame and stats - adapted for Gradio streaming
-        yield (
-            annotated_frame[:, :, ::-1],  # Convert BGR to RGB
-            None,
-            stats_df,
-            f"{avg_confidence:.2%}"
-        )
+        out.write(annotated_frame)
         
-    cap.release()
-
-# Define Gradio interface
-def create_app():
-    with gr.Blocks() as app:
-        gr.Markdown("### YOLO Object Detection")
+        frame_stats, frame_conf, detections = get_detection_stats(results)
+        for idx, row in frame_stats.iterrows():
+            total_stats[row['Class']] += row['Count']
+        total_confidence += frame_conf
+        total_detections += detections
+        frame_count += 1
         
-        with gr.Row():
-            with gr.Column():
-                input_type = gr.Radio(["Image", "Video", "Real-time"], label="Select Input Type", value="Image")
-                image_input = gr.Image(label="Upload Image", visible=True, type="pil")
-                video_input = gr.Video(label="Upload Video", visible=False)
-                model_name = gr.Dropdown(["yolov8n", "yolov8s", "yolov8m", "yolov8l", "yolov8x"],
-                                         label="Model", value="yolov8n")
-                image_size = gr.Slider(320, 1280, step=32, value=640, label="Image Size")
-                conf_threshold = gr.Slider(0.0, 1.0, step=0.05, value=0.25, label="Confidence Threshold")
-                detect_button = gr.Button("Run Detection")
-            
-            with gr.Column():
-                output_image = gr.Image(label="Detected Image", visible=True)
-                output_video = gr.Video(label="Detected Video", visible=False)
-                stats_df = gr.Dataframe(label="Detection Statistics", headers=["Class", "Count"])
-                avg_confidence = gr.Textbox(label="Average Confidence Score")
-        
-        # Change visibility based on input type
-        def update_inputs(input_type):
-            if input_type == "Image":
-                return gr.update(visible=True), gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
-            elif input_type == "Video":
-                return gr.update(visible=False), gr.update(visible=True), gr.update(visible=False), gr.update(visible=True)
-            else:  # Real-time
-                return gr.update(visible=False), gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
-        
-        input_type.change(fn=update_inputs, inputs=[input_type],
-                          outputs=[image_input, video_input, output_image, output_video])
-        
-        # Run inference
-       
-    return app
-
-# Launch the app
-if __name__ == "__main__":
-    def run_realtime_yolo_stream(model_name, image_size, conf_threshold):
-        model_rt = YOLO(model_name)
-        cap = cv2.VideoCapture(0)
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-            results = model_rt.predict(source=frame, imgsz=image_size, conf=conf_threshold)
-            annotated_frame = results[0].plot()
-            class_counts = Counter()
-            for detection in results[0].boxes:
-                class_name = results[0].names[int(detection.cls)]
-                class_counts[class_name] += 1
-            stats_df = pd.DataFrame({
-                'Class': list(class_counts.keys()),
-                'Count': list(class_counts.values())
-            })
-            avg_confidence = sum(float(detection.conf) for detection in results[0].boxes) / len(results[0].boxes) if results[0].boxes else 0
-            yield annotated_frame[:, :, ::-1], None, stats_df, f"{avg_confidence:.2%}"
-        cap.release()
-
-    app = create_app()
+        progress_bar.progress(min(frame_count / total_frames, 1.0))
     
-    # Override detect button for real-time streaming
-    def detect_stream(input_type, image, video, model_name, image_size, conf_threshold):
-        if input_type == "Image" and image is not None:
-            return run_yolo(image=image, model_name=model_name, image_size=image_size, conf_threshold=conf_threshold)
-        elif input_type == "Video" and video is not None:
+    cap.release()
+    out.release()
+    
+    stats_df = pd.DataFrame({
+        'Class': list(total_stats.keys()),
+        'Count': list(total_stats.values())
+    })
+    avg_confidence = (total_confidence / frame_count) if frame_count > 0 else 0
+    
+    return output_path, stats_df, avg_confidence, total_detections
+
+# Main UI
+st.markdown('<div class="header-title">🎯 YOLOv8 Object Detector</div>', unsafe_allow_html=True)
+st.markdown('<div class="subheader-text">Real-time object detection with advanced analytics</div>', unsafe_allow_html=True)
+
+# Tab interface
+tab1, tab2, tab3 = st.tabs(["📷 Image", "🎥 Video", "⚙️ Settings"])
+
+with tab3:
+    st.subheader("Detection Settings")
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        model_name = st.selectbox(
+            "YOLO Model",
+            ["yolov8n", "yolov8s", "yolov8m", "yolov8l", "yolov8x"],
+            help="Larger models are more accurate but slower"
+        )
+    
+    with col2:
+        image_size = st.slider(
+            "Image Size",
+            min_value=320,
+            max_value=1280,
+            value=640,
+            step=32,
+            help="Higher sizes may improve accuracy but increase processing time"
+        )
+    
+    with col3:
+        conf_threshold = st.slider(
+            "Confidence Threshold",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.25,
+            step=0.05,
+            help="Lower values detect more objects (higher false positives)"
+        )
+
+with tab1:
+    st.subheader("Image Detection")
+    
+    col1, col2 = st.columns([1, 1.2])
+    
+    with col1:
+        st.markdown("### Upload Image")
+        uploaded_image = st.file_uploader("Choose an image", type=["jpg", "jpeg", "png", "bmp"])
+        
+        if uploaded_image:
+            image = Image.open(uploaded_image)
+            st.image(image, caption="Uploaded Image", use_column_width=True)
+            
+            if st.button("🔍 Detect Objects", key="img_detect"):
+                with st.spinner("Processing image..."):
+                    processed_img, stats, confidence, count = process_image(
+                        image, model_name, image_size, conf_threshold
+                    )
+                    st.session_state.processed_image = processed_img
+                    st.session_state.stats = stats
+                    st.session_state.confidence = confidence
+    
+    with col2:
+        st.markdown("### Detection Results")
+        if st.session_state.processed_image is not None:
+            st.image(st.session_state.processed_image, caption="Detected Objects", use_column_width=True)
+            
+            # Metrics
+            result_col1, result_col2, result_col3 = st.columns(3)
+            with result_col1:
+                st.metric("Detections", len(st.session_state.stats))
+            with result_col2:
+                st.metric("Confidence", f"{st.session_state.confidence:.1%}")
+            with result_col3:
+                st.metric("Status", "✅ Complete")
+            
+            # Statistics table
+            st.markdown("### Detection Summary")
+            st.dataframe(st.session_state.stats, use_container_width=True, hide_index=True)
+        else:
+            st.info("👆 Upload an image and click 'Detect Objects' to see results")
+
+with tab2:
+    st.subheader("Video Detection")
+    
+    col1, col2 = st.columns([1, 1.2])
+    
+    with col1:
+        st.markdown("### Upload Video")
+        uploaded_video = st.file_uploader("Choose a video", type=["mp4", "avi", "mov", "mkv"])
+        
+        if uploaded_video:
+            st.video(uploaded_video)
+            
+            if st.button("🎬 Process Video", key="vid_detect"):
+                with st.spinner("Processing video..."):
+                    video_temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+                    video_temp.write(uploaded_video.read())
+                    video_temp.close()
+                    
+                    progress_bar = st.progress(0)
+                    output_path, stats, confidence, detections = process_video(
+                        video_temp.name, model_name, image_size, conf_threshold, progress_bar
+                    )
+                    
+                    st.session_state.stats = stats
+                    st.session_state.confidence = confidence
+                    st.session_state.processed_image = output_path
+                    
+                    os.unlink(video_temp.name)
+    
+    with col2:
+        st.markdown("### Processing Results")
+        if st.session_state.processed_image and isinstance(st.session_state.processed_image, str):
+            st.video(st.session_state.processed_image)
+            
+            # Metrics
+            result_col1, result_col2, result_col3 = st.columns(3)
+            with result_col1:
+                st.metric("Total Detections", len(st.session_state.stats) if st.session_state.stats is not None else 0)
+            with result_col2:
+                st.metric("Avg Confidence", f"{st.session_state.confidence:.1%}")
+            with result_col3:
+                st.metric("Status", "✅ Complete")
+            
+            # Statistics table
+            st.markdown("### Detection Summary")
+            st.dataframe(st.session_state.stats, use_container_width=True, hide_index=True)
+        else:
+            st.info("👆 Upload a video and click 'Process Video' to see results")
             return run_yolo(video=video, model_name=model_name, image_size=image_size, conf_threshold=conf_threshold)
         elif input_type == "Real-time":
             return run_realtime_yolo_stream(model_name, image_size, conf_threshold)
