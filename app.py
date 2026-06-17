@@ -153,19 +153,7 @@ def create_app():
                           outputs=[image_input, video_input, output_image, output_video])
         
         # Run inference
-        def detect(input_type, image, video, model_name, image_size, conf_threshold):
-            if input_type == "Image" and image is not None:
-                return run_yolo(image=image, model_name=model_name, image_size=image_size, conf_threshold=conf_threshold)
-            elif input_type == "Video" and video is not None:
-                return run_yolo(video=video, model_name=model_name, image_size=image_size, conf_threshold=conf_threshold)
-            elif input_type == "Real-time":  # Real-time detection
-                return run_realtime_yolo(model_name, image_size, conf_threshold)
-            return None, None, pd.DataFrame(), "0%"
-        
-        detect_button.click(detect,
-                            inputs=[input_type, image_input, video_input, model_name, image_size, conf_threshold],
-                            outputs=[output_image, output_video, stats_df, avg_confidence])
-    
+       
     return app
 
 # Launch the app
